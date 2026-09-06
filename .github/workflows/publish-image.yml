@@ -18,14 +18,19 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
+        # All of it in `include`: an `include` entry that names no new key
+        # is merged into the base combinations rather than becoming a job
+        # of its own, so a separate `debian` axis would collapse these two
+        # into a single job.
         include:
           - platform: linux/amd64
             runner: ubuntu-24.04
             arch: amd64
+            debian: bookworm
           - platform: linux/arm64
             runner: ubuntu-24.04-arm
             arch: arm64
-        debian: [ bookworm ]
+            debian: bookworm
 
     runs-on: ${{ matrix.runner }}
 
@@ -116,6 +121,7 @@ jobs:
           images: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}
           tags: |
             type=ref,event=branch
+            type=raw,value=latest,enable={{is_default_branch}}
             type=raw,value=${{ matrix.debian }}-dev,enable=${{ github.ref == format('refs/heads/{0}', 'dev') }}
             type=raw,value=${{ matrix.debian }},enable=${{ github.ref == format('refs/heads/{0}', 'master') }}
 
