@@ -10,23 +10,28 @@ env:
   IMAGE_NAME: ${{ github.repository }}
 
 jobs:
-  build-and-push-image:
+  # Each architecture builds natively on its own runner and pushes an
+  # untagged, digest-addressed image; the merge job collects those digests
+  # into one multi-arch tag. Building arm64 under emulation is impractical
+  # here because the image compiles Cyrus from source.
+  build:
     strategy:
       fail-fast: false
       matrix:
-        # In building cyrus-docker, we have empty platform (Intel-ish)
-        # and ARM, for macOS.  We build bookworm and trixie.  The
-        # cyrus-docker-test-server Dockerfile isn't set up to respect
-        # those yet, but I've left them here to build on later.
-        platform: [ "" ]
+        include:
+          - platform: linux/amd64
+            runner: ubuntu-24.04
+            arch: amd64
+          - platform: linux/arm64
+            runner: ubuntu-24.04-arm
+            arch: arm64
         debian: [ bookworm ]
-    runs-on: ubuntu-24.04${{ matrix.platform }}
+
+    runs-on: ${{ matrix.runner }}
 
     permissions:
       contents: read
       packages: write
-      attestations: write
-      id-token: write
 
     steps:
       - name: Checkout repository
@@ -39,31 +44,104 @@ jobs:
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
 
-      - name: Extract metadata (tags, labels) for Docker
+      - name: Extract labels for Docker
         id: meta
         uses: docker/metadata-action@v6.1.0
         with:
           images: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}
           labels: |
             org.cyrusimap.cyrus-docker.built-from=${{ github.sha }}
-          tags: |
-            type=ref,event=branch,enable=${{ matrix.platform == '' }}
-            type=raw,value=${{ matrix.debian }}-dev${{ matrix.platform }},enable=${{ github.ref == format('refs/heads/{0}', 'dev') }}
-            type=raw,value=${{ matrix.debian }}${{ matrix.platform }},enable=${{ github.ref == format('refs/heads/{0}', 'master') }}
 
-      - name: Build and push OCI image
-        id: push
+      - name: Build and push image by digest
+        id: build
         uses: docker/build-push-action@v7.2.0
         with:
           context: .
-          # build-args: DEBIAN_VERSION=${{ matrix.debian }}
-          push: true
-          tags: ${{ steps.meta.outputs.tags }}
+          platforms: ${{ matrix.platform }}
           labels: ${{ steps.meta.outputs.labels }}
+          outputs: type=image,name=${{ env.REGISTRY }}/${{ env.IMAGE_NAME }},push-by-digest=true,name-canonical=true,push=true
+
+      - name: Record the digest
+        run: |
+          mkdir -p /tmp/digests
+          echo -n "${{ steps.build.outputs.digest }}" \
+            > "/tmp/digests/${{ matrix.debian }}-${{ matrix.arch }}"
+
+      - name: Upload the digest
+        uses: actions/upload-artifact@v4
+        with:
+          name: digest-${{ matrix.debian }}-${{ matrix.arch }}
+          path: /tmp/digests/*
+          retention-days: 1
+          if-no-files-found: error
+
+  merge:
+    needs: build
+    runs-on: ubuntu-24.04
+
+    permissions:
+      contents: read
+      packages: write
+      attestations: write
+      id-token: write
+
+    strategy:
+      matrix:
+        debian: [ bookworm ]
+
+    steps:
+      - name: Download the digests
+        uses: actions/download-artifact@v4
+        with:
+          path: /tmp/digests
+          pattern: digest-${{ matrix.debian }}-*
+          merge-multiple: true
+
+      - name: Log in to the Container registry
+        uses: docker/login-action@v4.2.0
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Extract metadata (tags) for Docker
+        id: meta
+        uses: docker/metadata-action@v6.1.0
+        with:
+          images: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}
+          tags: |
+            type=ref,event=branch
+            type=raw,value=${{ matrix.debian }}-dev,enable=${{ github.ref == format('refs/heads/{0}', 'dev') }}
+            type=raw,value=${{ matrix.debian }},enable=${{ github.ref == format('refs/heads/{0}', 'master') }}
+
+      - name: Create the multi-arch manifest
+        id: manifest
+        working-directory: /tmp/digests
+        env:
+          META_JSON: ${{ steps.meta.outputs.json }}
+        run: |
+          set -eu
+          refs=""
+          for f in *; do
+            refs="$refs ${REGISTRY}/${IMAGE_NAME}@$(cat "$f")"
+          done
+          tags=$(jq -cr '.tags | map("-t " + .) | join(" ")' <<< "$META_JSON")
+          # shellcheck disable=SC2086
+          docker buildx imagetools create $tags $refs
+          first=$(jq -cr '.tags[0]' <<< "$META_JSON")
+          digest=$(docker buildx imagetools inspect "$first" \
+                     --format '{{ json .Manifest.Digest }}' | tr -d '"')
+          echo "digest=$digest" >> "$GITHUB_OUTPUT"
+          echo "first_tag=$first" >> "$GITHUB_OUTPUT"
+
+      - name: Show what was published
+        env:
+          FIRST_TAG: ${{ steps.manifest.outputs.first_tag }}
+        run: docker buildx imagetools inspect "$FIRST_TAG"
 
       - name: Generate artifact attestation
         uses: actions/attest-build-provenance@v4.1.0
         with:
-          subject-name: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME}}
-          subject-digest: ${{ steps.push.outputs.digest }}
+          subject-name: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}
+          subject-digest: ${{ steps.manifest.outputs.digest }}
           push-to-registry: false
